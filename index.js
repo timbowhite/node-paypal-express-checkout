@@ -1,19 +1,29 @@
+'use strict'; 
+
 var urlParser = require('url');
 var https = require('https');
 var querystring = require('querystring');
 
-function Paypal(username, password, signature, returnUrl, cancelUrl, debug) {
+/**
+ * Instantiates a new Paypal object 
+ *
+ * @param {object} opt                  object of options 
+ * @param {string} opt.username         API username
+ * @param {string} opt.password         API password
+ * @param {string} opt.signature        API signature
+ * @param {bool} [opt.test]             flag to use paypal test system, default = false
+ */
+function Paypal(opt){ 
 
-	this.username = username;
-	this.password = password;
+
+	this.username = opt.username;
+	this.password = opt.password;
+	this.signature = opt.signature;
 	this.solutiontype = 'Mark';
-	this.signature = signature;
-	this.debug = debug || false;
-	this.returnUrl = returnUrl;
-	this.cancelUrl = cancelUrl;
+	this.test = 'test' in opt ? !!opt.test : false; 
 
-	this.url = 'https://' + (debug ? 'api-3t.sandbox.paypal.com' : 'api-3t.paypal.com') + '/nvp';
-	this.redirect = 'https://' + (debug ? 'www.sandbox.paypal.com/cgi-bin/webscr' : 'www.paypal.com/cgi-bin/webscr');
+	this.url = 'https://' + (this.test ? 'api-3t.sandbox.paypal.com' : 'api-3t.paypal.com') + '/nvp';
+	this.redirect = 'https://' + (this.test ? 'www.sandbox.paypal.com/cgi-bin/webscr' : 'www.paypal.com/cgi-bin/webscr');
 };
 
 Paypal.prototype.params = function() {
@@ -23,92 +33,96 @@ Paypal.prototype.params = function() {
 		PWD: self.password,
 		SIGNATURE: self.signature,
 		SOLUTIONTYPE: self.solutiontype,
-		VERSION: '52.0'
+		VERSION: '121'
 	};
 };
 
-/*
-	Get payment detail
-	@token {String}
-	@payer {String} :: PayerID
-	@callback {Function} :: callback(err, data, invoiceNumber, price);
-	return {Paypal}
-*/
-Paypal.prototype.detail = function(token, payer, callback) {
-
-	if (typeof(token.get) !== 'undefined' && typeof(payer) === 'function') {
-		callback = payer;
-		payer = token.get.PayerID;
-		token = token.get.token;
-	}
+/**
+ * Gets payment detail and optionally completes the express checkout order. To get the
+ * payment status of the order, pass opt.complete = false, and check the
+ * CHECKOUTSTATUS key in the returned data. if the value is 'PaymentActionCompleted', the order is paid. 
+ * 
+ * @function
+ * @param {object} opt              object of options
+ * @param {string} opt.token        token value from payl call (ie. SetExpressCheckout) 
+ * @param {string} [opt.notifyUrl]  url for IPN. requires that opt.complete is set to true
+ * @param {boolean} opt.complete    flag to complete the express checkout by calling DoExpressCheckoutPayment.
+ *                                  Will only occur if the order has not been paid by customer.
+ *                                  default = true. 
+ * @param {function} callback       function passed 2 params: err and data from last API call.
+ *                                  If data.PAID is true, then the order has been paid. 
+ * @return {object} 
+ */
+Paypal.prototype.detail = function(opt, callback) {
+    if (! ('complete' in opt)) opt.complete = true;
 
 	var self = this;
 	var params = self.params();
 
-	params.TOKEN = token;
+	params.TOKEN = opt.token;
 	params.METHOD = 'GetExpressCheckoutDetails';
 
 	self.request(self.url, 'POST', params, function(err, data) {
+		if (err) return callback(err, data);
+        data.PAID = false;
+        if (! opt.complete || data.CHECKOUTSTATUS === 'PaymentActionCompleted'){
+            data.PAID = true;
+            return callback(null, data);
+        }
 
-		if (err) {
-			callback(err, data);
-			return;
-		}
+		var params = self.params(),
+            custom = data.PAYMENTREQUEST_0_CUSTOM.split('|');
 
-		if (typeof(data.CUSTOM) === 'undefined') {
-			callback(data, null);
-			return;
-		}
-
-		var custom = data.CUSTOM.split('|');
-
-		var params = self.params();
-		params.PAYMENTACTION = 'Sale';
-		params.PAYERID = payer;
-		params.TOKEN = token;
-		params.AMT = custom[1];
-		params.CURRENCYCODE = custom[2];
+        params.PAYMENTREQUEST_0_AMT = custom[1];
+		params.PAYERID = data.PAYERID;
+		params.TOKEN = opt.token;
 		params.METHOD = 'DoExpressCheckoutPayment';
+        if (opt.notifyUrl) params.PAYMENTREQUEST_0_NOTIFYURL = opt.notifyUrl;
 
 		self.request(self.url, 'POST', params, function(err, data) {
-
-			if (err) {
-				callback(err, data);
-				return;
-			}
-
-			callback(null, data, custom[0], custom[1]);
+			if (err) return callback(err, data);
+            data.PAID = false;
+            if (data.PAYMENTINFO_0_PAYMENTSTATUS === 'Completed'){
+                data.PAID = true;
+            }
+			callback(null, data);
 		});
 	});
 
 	return self;
 };
 
-/*
-	Get payment detail
-	@invoiceNumber {String}
-	@amout {Number}
-	@description {String}
-	@currency {String} :: EUR, USD
-	@callback {Function} :: callback(err, url);
-	return {Paypal}
-*/
-Paypal.prototype.pay = function(invoiceNumber, amout, description, currency, callback) {
+/**
+ * Generates a checkout express invoice 
+ * @name pay
+ * @function
+ * @param {object} opt                          object of options
+ * @param {string} opt.invoiceNumber 
+ * @param {float|string} opt.amount 
+ * @param {string} opt.description 
+ * @param {string} opt.currency                 3 letter currency code 
+ * @param {string} opt.returnUrl                URL to return the user to after invoice has been paid
+ * @param {string} opt.cancelUrl                URL to return the user to when invoice has been canceled 
+ * @param {function} callback                   callback function passed 3 params: error, paypal invoice url, and  
+ *                                              data object returned from API
+ * @return 
+ */
+Paypal.prototype.pay = function(opt, callback) {
 
 	var self = this;
 	var params = self.params();
 
 	params.PAYMENTACTION = 'Sale';
-	params.AMT = prepareNumber(amout);
-	params.RETURNURL = self.returnUrl;
-	params.CANCELURL = self.cancelUrl;
-	params.DESC = description;
+	params.PAYMENTREQUEST_0_AMT = prepareNumber(opt.amount);
+	params.RETURNURL = opt.returnUrl;
+	params.CANCELURL = opt.cancelUrl;
+	params.PAYMENTREQUEST_0_DESC = opt.description;
 	params.NOSHIPPING = 1;
 	params.ALLOWNOTE = 1;
-	params.CURRENCYCODE = currency;
+	params.PAYMENTREQUEST_0_CURRENCYCODE = opt.currency;
 	params.METHOD = 'SetExpressCheckout';
-	params.INVNUM = invoiceNumber;
-	params.CUSTOM = invoiceNumber + '|' + params.AMT + '|' + currency;
+	params.INVNUM = opt.invoiceNumber;
+    params.PAYMENTREQUEST_0_CUSTOM = opt.invoiceNumber + '|' + params.PAYMENTREQUEST_0_AMT + '|' + params.CURRENCYCODE;
 
 	self.request(self.url, 'POST', params, function(err, data) {
 
@@ -118,7 +132,7 @@ Paypal.prototype.pay = function(invoiceNumber, amout, description, currency, cal
 		}
 
 		if (data.ACK === 'Success') {
-			callback(null, self.redirect + '?cmd=_express-checkout&useraction=commit&token=' + data.TOKEN);
+			callback(null, self.redirect + '?cmd=_express-checkout&useraction=commit&token=' + data.TOKEN, data);
 			return;
 		}
 
@@ -209,12 +223,12 @@ function prepareNumber(num, doubleZero) {
 exports.timeout = 10000;
 exports.Paypal = Paypal;
 
-exports.init = function(username, password, signature, returnUrl, cancelUrl, debug) {
-	return new Paypal(username, password, signature, returnUrl, cancelUrl, debug);
+exports.init = function(username, password, signature, returnUrl, cancelUrl, test) {
+	return new Paypal(username, password, signature, returnUrl, cancelUrl, test);
 };
 
-exports.create = function(username, password, signature, returnUrl, cancelUrl, debug) {
-	return exports.init(username, password, signature, returnUrl, cancelUrl, debug);
+exports.create = function(username, password, signature, returnUrl, cancelUrl, test) {
+	return exports.init(username, password, signature, returnUrl, cancelUrl, test);
 };
 
 
